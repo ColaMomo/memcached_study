@@ -22,29 +22,29 @@
 #include <pthread.h>
 
 /* powers-of-N allocation structures */
-
+//slabclass类型
 typedef struct {
-    unsigned int size;      /* sizes of items */
-    unsigned int perslab;   /* how many items per slab */
+    unsigned int size;      /* sizes of items */  //chunk的大小
+    unsigned int perslab;   /* how many items per slab */  //slab包含的chunk数目
 
-    void *slots;           /* list of item ptrs */
-    unsigned int sl_curr;   /* total free items in list */
+    void *slots;           /* list of item ptrs */	//当前slabclass的空闲item链表
+    unsigned int sl_curr;   /* total free items in list */	//当前slabclass还剩多少空闲的item
 
-    unsigned int slabs;     /* how many slabs were allocated for this class */
+    unsigned int slabs;     /* how many slabs were allocated for this class */  //这个slabclass已经分配的slab数目
 
-    void **slab_list;       /* array of slab pointers */
-    unsigned int list_size; /* size of prev array */
+    void **slab_list;       /* array of slab pointers */  //当前slabclass下的slab列表，每个元素是一个slab指针
+    unsigned int list_size; /* size of prev array */	//slab_list的大小，当slabs=list_size时，表示当前空间已经满了，需要增加slab
 
     unsigned int killing;  /* index+1 of dying slab, or zero if none */
     size_t requested; /* The number of requested bytes */
 } slabclass_t;
 
 static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
-static size_t mem_limit = 0;
-static size_t mem_malloced = 0;
+static size_t mem_limit = 0;  //内存上限
+static size_t mem_malloced = 0;  //已分配的内存
 static int power_largest;
 
-static void *mem_base = NULL;
+static void *mem_base = NULL;  //预分配的内存空间
 static void *mem_current = NULL;
 static size_t mem_avail = 0;
 
@@ -76,7 +76,7 @@ static void slabs_preallocate (const unsigned int maxslabs);
  * Given object size, return id to use when allocating/freeing memory for object
  * 0 means error: can't store such a large object
  */
-
+//根据item大小找到合适的slabclass
 unsigned int slabs_clsid(const size_t size) {
     int res = POWER_SMALLEST;
 
@@ -92,14 +92,16 @@ unsigned int slabs_clsid(const size_t size) {
  * Determines the chunk sizes and initializes the slab class descriptors
  * accordingly.
  */
+ //初始化slabs，这里会对一些内存管理进行初始化
 void slabs_init(const size_t limit, const double factor, const bool prealloc) {
     int i = POWER_SMALLEST - 1;
     unsigned int size = sizeof(item) + settings.chunk_size;
 
-    mem_limit = limit;
+    mem_limit = limit;  //这个limit就是启动时用户设置的最大内存上线
 
     if (prealloc) {
         /* Allocate everything in a big chunk with malloc */
+		//如果用户开启了预分配，则先把上线的内存先分配出来，放到mem_base全局变量中
         mem_base = malloc(mem_limit);
         if (mem_base != NULL) {
             mem_current = mem_base;
@@ -110,6 +112,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
         }
     }
 
+	//初始化各个slabclass对象
     memset(slabclass, 0, sizeof(slabclass));
 
     while (++i < POWER_LARGEST && size <= settings.item_size_max / factor) {
@@ -148,6 +151,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
     }
 }
 
+//内存预分配，如果用户开启了预分配，会调用此方法
+//先从mem_base为每个slabclass分割一个slab大小下来
 static void slabs_preallocate (const unsigned int maxslabs) {
     int i;
     unsigned int prealloc = 0;
@@ -171,8 +176,12 @@ static void slabs_preallocate (const unsigned int maxslabs) {
 
 }
 
+//检查是否要增大slab_list的大小
 static int grow_slab_list (const unsigned int id) {
     slabclass_t *p = &slabclass[id];
+	//p->slab_list是一个空间大小固定的数组，list_size是这个数组的长度
+	//p->slabs代表已经分配出去的slab数目
+	//如果slabs==list_size，说明需要增大slab_list的大小
     if (p->slabs == p->list_size) {
         size_t new_size =  (p->list_size != 0) ? p->list_size * 2 : 16;
         void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
@@ -183,21 +192,30 @@ static int grow_slab_list (const unsigned int id) {
     return 1;
 }
 
+//把slab分拆为一个个chunk，并放入到相应的slots链表中
 static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     int x;
     for (x = 0; x < p->perslab; x++) {
+		//加入slots链表
         do_slabs_free(ptr, 0, id);
         ptr += p->size;
     }
 }
 
+//分配新的slab，仅当当前的slabclass中slots没有空闲的空间才调用
 static int do_slabs_newslab(const unsigned int id) {
     slabclass_t *p = &slabclass[id];
+	//确定slab的大小
+	//如果开启了自定义slab大小，则使用定义的大小；未定义的情况，使用默认大小（1M）
     int len = settings.slab_reassign ? settings.item_size_max
-        : p->size * p->perslab;
+        : p->size * p->perslab;  
     char *ptr;
 
+	//如果内存超出限制，分配失败进入if
+	//否则调用grow_slab_list检查是否要增大slab_list的大小
+	//如果在grow_slab_list返回失败，则不继续分配空间，进入if
+	//否则分配空间memory_allocate，如果分配失败，同样进入if
     if ((mem_limit && mem_malloced + len > mem_limit && p->slabs > 0) ||
         (grow_slab_list(id) == 0) ||
         ((ptr = memory_allocate((size_t)len)) == 0)) {
@@ -206,36 +224,41 @@ static int do_slabs_newslab(const unsigned int id) {
         return 0;
     }
 
-    memset(ptr, 0, (size_t)len);
-    split_slab_page_into_freelist(ptr, id);
+    memset(ptr, 0, (size_t)len);  //清空内存空间
+    split_slab_page_into_freelist(ptr, id);  //把新申请的slab分拆为一个个chunk放到slots中去
 
-    p->slab_list[p->slabs++] = ptr;
-    mem_malloced += len;
+    p->slab_list[p->slabs++] = ptr; //把新的slab加到slab_list数组中
+    mem_malloced += len;  //记下已分配的空间大小
     MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
 
     return 1;
 }
 
 /*@null@*/
+//分配内存空间
 static void *do_slabs_alloc(const size_t size, unsigned int id) {
     slabclass_t *p;
     void *ret = NULL;
     item *it = NULL;
 
+	//id在0-200之间
     if (id < POWER_SMALLEST || id > power_largest) {
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, 0);
         return NULL;
     }
 
-    p = &slabclass[id];
+    p = &slabclass[id];  //取得当前id对应的slabclass
     assert(p->sl_curr == 0 || ((item *)p->slots)->slabs_clsid == 0);
 
     /* fail unless we have space at the end of a recently allocated page,
        we have something on our freelist, or we could allocate a new page */
-    if (! (p->sl_curr != 0 || do_slabs_newslab(id) != 0)) {
+    //如果slots链表中没有空闲的空间，则执行do_slabs_newslab分配新的slab
+	if (! (p->sl_curr != 0 || do_slabs_newslab(id) != 0)) {
         /* We don't have more memory available */
         ret = NULL;
-    } else if (p->sl_curr != 0) {
+    } 
+	//如果slots链表还有空闲的空间，把空闲的item分配出去
+	else if (p->sl_curr != 0) {
         /* return off our freelist */
         it = (item *)p->slots;
         p->slots = it->next;
@@ -245,7 +268,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
     }
 
     if (ret) {
-        p->requested += size;
+        p->requested += size;  //分配成功，记录已分配的字节数
         MEMCACHED_SLABS_ALLOCATE(size, id, p->size, ret);
     } else {
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, id);
@@ -267,13 +290,13 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     p = &slabclass[id];
 
     it = (item *)ptr;
-    it->it_flags |= ITEM_SLABBED;
+    it->it_flags |= ITEM_SLABBED;  //把item标记为slabbed状态
     it->prev = 0;
-    it->next = p->slots;
+    it->next = p->slots;  //插入到slots链表中
     if (it->next) it->next->prev = it;
     p->slots = it;
 
-    p->sl_curr++;
+    p->sl_curr++; //空闲item数加1
     p->requested -= size;
     return;
 }
@@ -368,13 +391,17 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
     add_stats(NULL, 0, NULL, 0, c);
 }
 
+//分配内存空间
 static void *memory_allocate(size_t size) {
     void *ret;
-
+	
+	//没有开启内存预分配，则使用malloc分配内存空间
     if (mem_base == NULL) {
         /* We are not using a preallocated large memory chunk */
         ret = malloc(size);
-    } else {
+    } 
+	//开启内存预分配，从与预分配好的内存块中取出一块
+	else {
         ret = mem_current;
 
         if (size > mem_avail) {
@@ -397,6 +424,7 @@ static void *memory_allocate(size_t size) {
     return ret;
 }
 
+//分配内存空间
 void *slabs_alloc(size_t size, unsigned int id) {
     void *ret;
 
@@ -644,6 +672,7 @@ static void slab_rebalance_finish(void) {
  * Move to its own thread (created/destroyed as needed) once automover is more
  * complex.
  */
+ //slab自动重分配时，执行此函数做出重分配方案决定
 static int slab_automove_decision(int *src, int *dst) {
     static uint64_t evicted_old[POWER_LARGEST];
     static unsigned int slab_zeroes[POWER_LARGEST];
@@ -712,6 +741,7 @@ static int slab_automove_decision(int *src, int *dst) {
  * Does not use spinlocks since it is not timing sensitive. Burn less CPU and
  * go to sleep if locks are contended
  */
+ //运行slab维护线程，slab维护线程的执行入口
 static void *slab_maintenance_thread(void *arg) {
     int src, dest;
 
@@ -719,7 +749,7 @@ static void *slab_maintenance_thread(void *arg) {
         if (settings.slab_automove == 1) {
             if (slab_automove_decision(&src, &dest) == 1) {
                 /* Blind to the return codes. It will retry on its own */
-                slabs_reassign(src, dest);
+                slabs_reassign(src, dest);  //移动slab，重分配
             }
             sleep(1);
         } else {
@@ -838,6 +868,7 @@ void slabs_rebalancer_resume(void) {
 static pthread_t maintenance_tid;
 static pthread_t rebalance_tid;
 
+//启动slab维护线程
 int start_slab_maintenance_thread(void) {
     int ret;
     slab_rebalance_signal = 0;
@@ -869,6 +900,7 @@ int start_slab_maintenance_thread(void) {
     return 0;
 }
 
+//停止slab维护线程，逻辑和停止hash表维护线程一样
 void stop_slab_maintenance_thread(void) {
     mutex_lock(&cache_lock);
     do_run_slab_thread = 0;

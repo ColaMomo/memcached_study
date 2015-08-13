@@ -31,11 +31,11 @@ typedef struct {
     uint64_t crawler_reclaimed;
 } itemstats_t;
 
-static item *heads[LARGEST_ID];
-static item *tails[LARGEST_ID];
-static crawler crawlers[LARGEST_ID];
-static itemstats_t itemstats[LARGEST_ID];
-static unsigned int sizes[LARGEST_ID];
+static item *heads[LARGEST_ID];  //各个slabclass的lru队列头指针数组
+static item *tails[LARGEST_ID];  //各个slabclass的lru队列尾指针数组
+static crawler crawlers[LARGEST_ID];	//各个slabclass的item爬虫数组
+static itemstats_t itemstats[LARGEST_ID];  //各个slabclass的item统计数组
+static unsigned int sizes[LARGEST_ID];  //各个slabclass的chunk大小数组
 
 static int crawler_count = 0;
 static volatile int do_run_lru_crawler_thread = 0;
@@ -43,6 +43,7 @@ static int lru_crawler_initialized = 0;
 static pthread_mutex_t lru_crawler_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  lru_crawler_cond = PTHREAD_COND_INITIALIZER;
 
+//重置统计
 void item_stats_reset(void) {
     mutex_lock(&cache_lock);
     memset(itemstats, 0, sizeof(itemstats));
@@ -79,6 +80,7 @@ uint64_t get_cas_id(void) {
  *
  * Returns the total size of the header.
  */
+ //计算item总大小
 static size_t item_make_header(const uint8_t nkey, const int flags, const int nbytes,
                      char *suffix, uint8_t *nsuffix) {
     /* suffix is defined at 40 chars elsewhere.. */
@@ -86,45 +88,55 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
     return sizeof(item) + nkey + *nsuffix + nbytes;
 }
 
+
 /*@null@*/
+//item分配
+//这个函数包含了memcached内存管理机制的逻辑
 item *do_item_alloc(char *key, const size_t nkey, const int flags,
                     const rel_time_t exptime, const int nbytes,
                     const uint32_t cur_hv) {
     uint8_t nsuffix;
     item *it = NULL;
     char suffix[40];
-    size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
+    size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix); //item总大小
     if (settings.use_cas) {
-        ntotal += sizeof(uint64_t);
+        ntotal += sizeof(uint64_t); //如果有用到cas，那么item大小还要加上unit64_t的size
     }
 
-    unsigned int id = slabs_clsid(ntotal);
+    unsigned int id = slabs_clsid(ntotal); //根据item的大小，找到适合的slabclass
     if (id == 0)
         return 0;
 
-    mutex_lock(&cache_lock);
+    mutex_lock(&cache_lock); //cache锁
     /* do a quick check if we have any expired items in the tail.. */
-    int tries = 5;
+	int tries = 5;
     int tried_alloc = 0;
     item *search;
     void *hold_lock = NULL;
     rel_time_t oldest_live = settings.oldest_live;
 
-    search = tails[id];
+    search = tails[id]; //全局变量，tails[x]是id为x的slabclass lru链表的尾部
     /* We walk up *only* for locked items. Never searching for expired.
      * Waste of CPU for almost all deployments */
-    for (; tries > 0 && search != NULL; tries--, search=search->prev) {
+    //首先扫描一下lru链表的末尾有没有过期的item，有的话就用过期的空间
+	//默认从尾部向前扫描5次
+	for (; tries > 0 && search != NULL; tries--, search=search->prev) {
         if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
             /* We are a crawler, ignore it. */
-            tries++;
+            //这里只是搜索过期的item，对于异常的item，直接忽略继续查找
+			tries++;
             continue;
         }
-        uint32_t hv = hash(ITEM_key(search), search->nkey);
+		//item的hash值
+		//hv有两个作用：1.用于hash表保存item 2.用于item lock表中锁住item，通过hv计算出item_lock中哪个锁对当前item加锁
+		//不同item的hash值可能相同，hash表中用链表的方式解决冲突；item lock中多个item共享一个锁
+        uint32_t hv = hash(ITEM_key(search), search->nkey); 
         /* Attempt to hash item lock the "search" item. If locked, no
          * other callers can incr the refcount
          */
         /* Don't accidentally grab ourselves, or bail if we can't quicklock */
-        if (hv == cur_hv || (hold_lock = item_trylock(hv)) == NULL)
+        //锁住当前item
+		if (hv == cur_hv || (hold_lock = item_trylock(hv)) == NULL)
             continue;
         /* Now see if the item is refcount locked */
         if (refcount_incr(&search->refcount) != 2) {
@@ -144,6 +156,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         }
 
         /* Expired or flushed */
+		//如果找到过期的item
         if ((search->exptime != 0 && search->exptime < current_time)
             || (search->time <= oldest_live && oldest_live <= current_time)) {
             itemstats[id].reclaimed++;
@@ -151,26 +164,33 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
                 itemstats[id].expired_unfetched++;
             }
             it = search;
+			//更新统计数据
             slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
-            do_item_unlink_nolock(it, hv);
+            //把旧的item从hash表和LRU链表中移除
+			do_item_unlink_nolock(it, hv);
             /* Initialize the item block: */
             it->slabs_clsid = 0;
-        } else if ((it = slabs_alloc(ntotal, id)) == NULL) {
-            tried_alloc = 1;
-            if (settings.evict_to_free == 0) {
+        } 
+		//如果没有找到过期的item，则调用slabs_alloc分配空间
+		//如果slabs_alloc返回null，表示分配失败，内存空间已满
+		//需要按LRU进行淘汰
+		else if ((it = slabs_alloc(ntotal, id)) == NULL) {
+            tried_alloc = 1;  //标记一下，表示有尝试调用slabs_alloc分配空间
+            //记录被淘汰item的信息, 使用memcached经常会查看的evicted_time就是在这里赋值的
+			if (settings.evict_to_free == 0) {
                 itemstats[id].outofmemory++;
             } else {
                 itemstats[id].evicted++;
-                itemstats[id].evicted_time = current_time - search->time;
+                itemstats[id].evicted_time = current_time - search->time; //被淘汰item距离上次使用的时间
                 if (search->exptime != 0)
                     itemstats[id].evicted_nonzero++;
                 if ((search->it_flags & ITEM_FETCHED) == 0) {
                     itemstats[id].evicted_unfetched++;
                 }
                 it = search;
-                slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
-                do_item_unlink_nolock(it, hv);
-                /* Initialize the item block: */
+                slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal); //更新统计数据
+                do_item_unlink_nolock(it, hv);  //从hash表和LRU链表中移除
+                /* Initialize the item block: */  
                 it->slabs_clsid = 0;
 
                 /* If we've just evicted an item, and the automover is set to
@@ -180,6 +200,8 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
                  * would be an eviction. Then kick off the slab mover before the
                  * eviction happens.
                  */
+				 //默认情况下，slab_automove=1，会合理地更具淘汰统计数据来分析怎么进行slabclass空间的分配
+				 //如果slab_automove=2，只要分配失败了，马上进行slabclass空间的重分配
                 if (settings.slab_automove == 2)
                     slabs_reassign(-1, id);
             }
@@ -192,9 +214,12 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         break;
     }
 
+	//查找5次过期的item都失败，并且也没有淘汰可用且没有过期的item
+	//分配新的内存空间
     if (!tried_alloc && (tries == 0 || search == NULL))
         it = slabs_alloc(ntotal, id);
 
+	//分配失败，返回null
     if (it == NULL) {
         itemstats[id].outofmemory++;
         mutex_unlock(&cache_lock);
@@ -207,6 +232,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     /* Item initialization can happen outside of the lock; the item's already
      * been removed from the slab LRU.
      */
+	 //item内存空间分配成功，做一些初始化工作
     it->refcount = 1;     /* the caller will have a reference */
     mutex_unlock(&cache_lock);
     it->next = it->prev = it->h_next = 0;
@@ -223,6 +249,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     return it;
 }
 
+//将item内存置为空闲，以供再使用，这里的free不是把内存空间释放
 void item_free(item *it) {
     size_t ntotal = ITEM_ntotal(it);
     unsigned int clsid;
@@ -233,7 +260,7 @@ void item_free(item *it) {
 
     /* so slab size changer can tell later if item is already free or not */
     clsid = it->slabs_clsid;
-    it->slabs_clsid = 0;
+    it->slabs_clsid = 0;  //free掉的 item的slabs_clsid设为0
     DEBUG_REFCNT(it, 'F');
     slabs_free(it, ntotal, clsid);
 }
@@ -242,6 +269,7 @@ void item_free(item *it) {
  * Returns true if an item will fit in the cache (its size does not exceed
  * the maximum for a cache entry.)
  */
+ //检查item的大小
 bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     char prefix[40];
     uint8_t nsuffix;
@@ -255,6 +283,7 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     return slabs_clsid(ntotal) != 0;
 }
 
+//将item插入相应的slabclass lru链表中
 static void item_link_q(item *it) { /* item is the new head */
     item **head, **tail;
     assert(it->slabs_clsid < LARGEST_ID);
@@ -273,6 +302,7 @@ static void item_link_q(item *it) { /* item is the new head */
     return;
 }
 
+//将item从slabclass lru链表中删除
 static void item_unlink_q(item *it) {
     item **head, **tail;
     assert(it->slabs_clsid < LARGEST_ID);
@@ -296,6 +326,11 @@ static void item_unlink_q(item *it) {
     return;
 }
 
+//link item
+//主要操作包括：
+//1. 改变一些统计数据
+//2. 把item加入hash表
+//3. 把item加入相应的slabclass lru链表中
 int do_item_link(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
@@ -311,14 +346,15 @@ int do_item_link(item *it, const uint32_t hv) {
 
     /* Allocate a new CAS ID on link. */
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
-    assoc_insert(it, hv);
-    item_link_q(it);
+    assoc_insert(it, hv);  //插入hash表
+    item_link_q(it);  //插入lru链表
     refcount_incr(&it->refcount);
     mutex_unlock(&cache_lock);
 
     return 1;
 }
 
+//unlink item， 将item从hash表和lru链表中移除
 void do_item_unlink(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     mutex_lock(&cache_lock);
@@ -350,16 +386,19 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
     }
 }
 
+//当指向item的指针不用的时候都会调用此函数
 void do_item_remove(item *it) {
     MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
     assert(it->refcount > 0);
 
+	//引用计数减1，当引用计数为0时，free掉这块内存
     if (refcount_decr(&it->refcount) == 0) {
         item_free(it);
     }
 }
 
+//重置item在lru链表中的位置，更新最近使用时间
 void do_item_update(item *it) {
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
     if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
@@ -536,6 +575,7 @@ void do_item_stats_sizes(ADD_STAT add_stats, void *c) {
 }
 
 /** wrapper around assoc_find which does the lazy expiration logic */
+//读取item数据
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     //mutex_lock(&cache_lock);
     item *it = assoc_find(key, nkey, hv);
@@ -735,6 +775,7 @@ static item *crawler_crawl_q(item *it) {
 /* I pulled this out to make the main thread clearer, but it reaches into the
  * main thread's values too much. Should rethink again.
  */
+ //使用爬虫处理过期的item，这里讲这部分工作放入一个专门的线程来进行
 static void item_crawler_evaluate(item *search, uint32_t hv, int i) {
     rel_time_t oldest_live = settings.oldest_live;
     if ((search->exptime != 0 && search->exptime < current_time)
@@ -762,6 +803,7 @@ static void item_crawler_evaluate(item *search, uint32_t hv, int i) {
     }
 }
 
+//item爬虫线程入口，负责从lru链表中把过期的item free掉
 static void *item_crawler_thread(void *arg) {
     int i;
 
@@ -836,6 +878,7 @@ static void *item_crawler_thread(void *arg) {
 
 static pthread_t item_crawler_tid;
 
+//停止item爬虫线程
 int stop_item_crawler_thread(void) {
     int ret;
     pthread_mutex_lock(&lru_crawler_lock);
@@ -850,6 +893,7 @@ int stop_item_crawler_thread(void) {
     return 0;
 }
 
+//启动item爬虫线程
 int start_item_crawler_thread(void) {
     int ret;
 
@@ -923,6 +967,7 @@ enum crawler_result_type lru_crawler_crawl(char *slabs) {
     return CRAWLER_OK;
 }
 
+//初始化lru爬虫线程
 int init_lru_crawler(void) {
     if (lru_crawler_initialized == 0) {
         if (pthread_cond_init(&lru_crawler_cond, NULL) != 0) {

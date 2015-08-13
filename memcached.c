@@ -62,6 +62,7 @@ static void drive_machine(conn *c);
 static int new_socket(struct addrinfo *ai);
 static int try_read_command(conn *c);
 
+//尝试从socket中读取数据的结构枚举
 enum try_read_result {
     READ_DATA_RECEIVED,
     READ_NO_DATA_RECEIVED,
@@ -101,8 +102,8 @@ static void write_bin_error(conn *c, protocol_binary_response_status err,
 static void conn_free(conn *c);
 
 /** exported globals **/
-struct stats stats;
-struct settings settings;
+struct stats stats;  //全局统计变量
+struct settings settings;  //全局配置变量
 time_t process_started;     /* when the process was started */
 conn **conns;
 
@@ -110,10 +111,11 @@ struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
 
 /** file scope variables **/
-static conn *listen_conn = NULL;
-static int max_fds;
-static struct event_base *main_base;
+static conn *listen_conn = NULL;  //全局的监听连接对象
+static int max_fds;  //fds上限
+static struct event_base *main_base;  //主线程的libevent对象
 
+//向客户端发送数据的结果枚举
 enum transmit_result {
     TRANSMIT_COMPLETE,   /** All done writing. */
     TRANSMIT_INCOMPLETE, /** More data remaining to write. */
@@ -288,7 +290,7 @@ static int add_msghdr(conn *c)
     return 0;
 }
 
-extern pthread_mutex_t conn_lock;
+extern pthread_mutex_t conn_lock;  //连接锁
 
 /*
  * Initializes the connections array. We don't actually allocate connection
@@ -341,6 +343,14 @@ static const char *prot_text(enum protocol prot) {
     return rv;
 }
 
+//创建连接函数
+//sfd: 要监听的socket fd
+//init_state: 连接的初始化状态conn_states
+//event_flags: 监听的事件
+//read_buff_size: 度缓存大小
+//transport: 监听的socket类型
+//base: libevent对象event_base
+//每监听一个fd，都会创建一个conn来保存连接信息
 conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
@@ -359,7 +369,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             return NULL;
         }
         MEMCACHED_CONN_CREATE(c);
-
+		
+		//初始化conn对象的一些参数
         c->rbuf = c->wbuf = 0;
         c->ilist = 0;
         c->suffixlist = 0;
@@ -420,6 +431,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
+	//向终端输出调试信息
     if (settings.verbose > 1) {
         if (init_state == conn_listening) {
             fprintf(stderr, "<%d server listening (%s)\n", sfd,
@@ -440,6 +452,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
+	//初始化conn对象的一些参数
     c->state = init_state;
     c->rlbytes = 0;
     c->cmd = -1;
@@ -462,10 +475,15 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     c->noreply = false;
 
+	//创建libevent监听事件，并指定回调函数event_handler
+	//主线程调用conn_new时，创建完listenfd后，调用此函数监听网络连接事件，此时conn_state为conn_listening
+	//worker线程调用conn_new时，监听到event事件的回调处理函数与主线程不同
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
+	//将事件加入到libevent中
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
-
+	
+	//把事件加入监听
     if (event_add(&c->event, 0) == -1) {
         perror("event_add");
         return NULL;
@@ -816,7 +834,7 @@ static int build_udp_headers(conn *c) {
     return 0;
 }
 
-
+//向客户端输出字符串
 static void out_string(conn *c, const char *str) {
     size_t len;
 
@@ -837,7 +855,7 @@ static void out_string(conn *c, const char *str) {
     c->msgcurr = 0;
     c->msgused = 0;
     c->iovused = 0;
-    add_msghdr(c);
+    add_msghdr(c);  //添加一个msghdr
 
     len = strlen(str);
     if ((len + 2) > c->wsize) {
@@ -846,12 +864,14 @@ static void out_string(conn *c, const char *str) {
         len = strlen(str);
     }
 
-    memcpy(c->wbuf, str, len);
-    memcpy(c->wbuf + len, "\r\n", 2);
+    memcpy(c->wbuf, str, len);  //把要发送的字符串写入wbuf字段中
+    memcpy(c->wbuf + len, "\r\n", 2);  //添加换行回车符
     c->wbytes = len + 2;
     c->wcurr = c->wbuf;
 
-    conn_set_state(c, conn_write);
+	//把连接状态设置为conn_write，状态机进入conn_write执行输出
+    conn_set_state(c, conn_write);  
+	//完成输出后，将状态切换为conn_new_cmd
     c->write_and_go = conn_new_cmd;
     return;
 }
@@ -860,6 +880,7 @@ static void out_string(conn *c, const char *str) {
  * Outputs a protocol-specific "out of memory" error. For ASCII clients,
  * this is equivalent to out_string().
  */
+ //当内存空间已满，且无法淘汰旧的item时，向客户端输出错误信息
 static void out_of_memory(conn *c, char *ascii_error) {
     const static char error_prefix[] = "SERVER_ERROR ";
     const static int error_prefix_len = sizeof(error_prefix) - 1;
@@ -879,6 +900,8 @@ static void out_of_memory(conn *c, char *ascii_error) {
  * we get here after reading the value in set/add/replace commands. The command
  * has been stored in c->cmd, and the item is ready in c->item.
  */
+ //解析文本协议时，执行set/add/replace命令把value数据填充到item后调用此函数
+ //主要做一些收尾工作
 static void complete_nread_ascii(conn *c) {
     assert(c != NULL);
 
@@ -944,6 +967,8 @@ static void complete_nread_ascii(conn *c) {
 
     }
 
+	//释放引用。这里不一定释放内存空间。
+	//是否释放内存空间，参见item_remove和do_item_remove
     item_remove(c->item);       /* release the c->item reference */
     c->item = 0;
 }
@@ -2252,6 +2277,7 @@ static void complete_nread_binary(conn *c) {
     }
 }
 
+//重置命令处理
 static void reset_cmd_handler(conn *c) {
     c->cmd = -1;
     c->substate = bin_no_state;
@@ -2260,6 +2286,13 @@ static void reset_cmd_handler(conn *c) {
         c->item = NULL;
     }
     conn_shrink(c);
+	//根据socket中是否有可读数据来决定进入哪个状态
+	//对于worker线程，收到主线程传递过来的client_fd后，注册event_handler，同时初始化一个conn对象作为drive_machine的参数，这里rbytes=0
+	//当worker线程监听到client_fd第一次有命令请求过来时（注意是第一次），wroker线程收到通知，然后调用drive_machine处理，此时rbytes=0，
+	//所以这里会进入conn_waiting状态，再把conn_waiting切换到conn_read，然后就退出了状态处理循环
+	//由于libevent默认的是水平触发，也就是说这个命令还没有被读取，下次会继续触发这个事件，此时c->state为conn_read状态，这里才会真正执行命令
+	//所以，当worker线程监听的client_fd第一次有命令过来的时候，会触发两次libevent的事件通知。
+	//第一次请求时，c->rbytes=0
     if (c->rbytes > 0) {
         conn_set_state(c, conn_parse_cmd);
     } else {
@@ -2285,9 +2318,10 @@ static void complete_nread(conn *c) {
  *
  * Returns the state of storage.
  */
+ //将item存入memcached的内存中
 enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
     char *key = ITEM_key(it);
-    item *old_it = do_item_get(key, it->nkey, hv);
+    item *old_it = do_item_get(key, it->nkey, hv);  //取出旧的item
     enum store_item_type stored = NOT_STORED;
 
     item *new_it = NULL;
@@ -2295,7 +2329,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
 
     if (old_it != NULL && comm == NREAD_ADD) {
         /* add only adds a nonexistent item, but promote to head of LRU */
-        do_item_update(old_it);
+        do_item_update(old_it);  //更新item信息，主要是lru链表
     } else if (!old_it && (comm == NREAD_REPLACE
         || comm == NREAD_APPEND || comm == NREAD_PREPEND))
     {
@@ -2378,10 +2412,14 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             }
         }
 
+		//SET命令会进入这里
         if (stored == NOT_STORED) {
             if (old_it != NULL)
+				//如果要SET的key已经存在，使用新的item覆盖旧的
                 item_replace(old_it, it, hv);
             else
+				//如果要SET的key不存在，则插入新的item
+				//主要做的工作有两点：插入hash表，插入lru链表
                 do_item_link(it, hv);
 
             c->cas = ITEM_get_cas(it);
@@ -3039,14 +3077,16 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
     set_noreply_maybe(c, tokens, ntokens);
 
+	//key的长度超出限制
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
         out_string(c, "CLIENT_ERROR bad command line format");
         return;
     }
 
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
+    key = tokens[KEY_TOKEN].value;  //键名
+    nkey = tokens[KEY_TOKEN].length;  //键的长度
 
+	//对命令相应的参数，如缓存超时时间等，进行赋值
     if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags)
            && safe_strtol(tokens[3].value, &exptime_int)
            && safe_strtol(tokens[4].value, (int32_t *)&vlen))) {
@@ -3081,6 +3121,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_set(key, nkey);
     }
 
+	//分配内存
     it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
 
     if (it == 0) {
@@ -3106,11 +3147,11 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     }
     ITEM_set_cas(it, req_cas_id);
 
-    c->item = it;
-    c->ritem = ITEM_data(it);
-    c->rlbytes = it->nbytes;
-    c->cmd = comm;
-    conn_set_state(c, conn_nread);
+    c->item = it;	//将item指针指向分配的内存空间
+    c->ritem = ITEM_data(it);	//将ritem指向it->data中要存放value的空间地址
+    c->rlbytes = it->nbytes;	//data的大小
+    c->cmd = comm;	//命令类型
+    conn_set_state(c, conn_nread);	//继续调用状态机，执行命令的另一半工作
 }
 
 static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -3394,11 +3435,14 @@ static void process_slabs_automove_command(conn *c, token_t *tokens, const size_
     return;
 }
 
+//解析与执行memcached命令
+//这里只是执行了命令的一半，然后根据命令类型再次改变conn_state使程序再次进入状态机，
+//完成命令的另一半工作
 static void process_command(conn *c, char *command) {
 
     token_t tokens[MAX_TOKENS];
     size_t ntokens;
-    int comm;
+    int comm; //命令类型
 
     assert(c != NULL);
 
@@ -3420,8 +3464,10 @@ static void process_command(conn *c, char *command) {
         return;
     }
 
+	//词法分析器，将命令分解成一个个token
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
-    if (ntokens >= 3 &&
+    //对分解出来的token进行语法分析，解析命令
+	if (ntokens >= 3 &&
         ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
          (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
 
@@ -3434,6 +3480,7 @@ static void process_command(conn *c, char *command) {
                 (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
 
+		//add/set/replace/prepend/append为“更新”命令，调用同一个函数执行命令
         process_update_command(c, tokens, ntokens, comm, false);
 
     } else if ((ntokens == 7 || ntokens == 8) && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
@@ -3446,6 +3493,7 @@ static void process_command(conn *c, char *command) {
 
     } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)) {
 
+		//执行get命令
         process_get_command(c, tokens, ntokens, true);
 
     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
@@ -3454,6 +3502,7 @@ static void process_command(conn *c, char *command) {
 
     } else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
 
+		//执行delete命令
         process_delete_command(c, tokens, ntokens);
 
     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "touch") == 0)) {
@@ -3639,11 +3688,13 @@ static void process_command(conn *c, char *command) {
 /*
  * if we have a complete line in the buffer, process it.
  */
+ //解析读取到的数据
 static int try_read_command(conn *c) {
     assert(c != NULL);
     assert(c->rcurr <= (c->rbuf + c->rsize));
-    assert(c->rbytes > 0);
+    assert(c->rbytes > 0);   
 
+	//udp协议
     if (c->protocol == negotiating_prot || c->transport == udp_transport)  {
         if ((unsigned char)c->rbuf[0] == (unsigned char)PROTOCOL_BINARY_REQ) {
             c->protocol = binary_prot;
@@ -3657,6 +3708,7 @@ static int try_read_command(conn *c) {
         }
     }
 
+	//二进制协议
     if (c->protocol == binary_prot) {
         /* Do we have the complete packet header? */
         if (c->rbytes < sizeof(c->binary_header)) {
@@ -3726,10 +3778,10 @@ static int try_read_command(conn *c) {
     } else {
         char *el, *cont;
 
-        if (c->rbytes == 0)
+        if (c->rbytes == 0)  //读buffer中没有待解析的数据
             return 0;
 
-        el = memchr(c->rcurr, '\n', c->rbytes);
+        el = memchr(c->rcurr, '\n', c->rbytes); //通过换行符先找到第一个命令
         if (!el) {
             if (c->rbytes > 1024) {
                 /*
@@ -3749,9 +3801,13 @@ static int try_read_command(conn *c) {
                 }
             }
 
-            return 0;
+            //如果没有找到换行符，说明数据还不构成一个完整的命令，返回0
+			return 0;
         }
-        cont = el + 1;
+		//记录下一个命令的起始位置
+        cont = el + 1; 
+		//将读取到的命令截取为字符串
+		//eg: GET abc\r\n 变为 GET abc\0
         if ((el - c->rcurr) > 1 && *(el - 1) == '\r') {
             el--;
         }
@@ -3760,8 +3816,10 @@ static int try_read_command(conn *c) {
         assert(cont <= (c->rcurr + c->rbytes));
 
         c->last_cmd_time = current_time;
+		//执行命令
         process_command(c, c->rcurr);
-
+		//当前命令执行完后，rcurr指向下一个命令的开头
+		//并计算rbytes的大小
         c->rbytes -= (cont - c->rcurr);
         c->rcurr = cont;
 
@@ -3821,6 +3879,8 @@ static enum try_read_result try_read_udp(conn *c) {
  *
  * @return enum try_read_result
  */
+ //读出请求的所有内容
+ //把socket中的数据读到c->rbuf中
 static enum try_read_result try_read_network(conn *c) {
     enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
     int res;
@@ -3834,7 +3894,7 @@ static enum try_read_result try_read_network(conn *c) {
     }
 
     while (1) {
-        if (c->rbytes >= c->rsize) {
+        if (c->rbytes >= c->rsize) { //读buffer空间填充
             if (num_allocs == 4) {
                 return gotdata;
             }
@@ -3856,17 +3916,18 @@ static enum try_read_result try_read_network(conn *c) {
             c->rsize *= 2;
         }
 
-        int avail = c->rsize - c->rbytes;
-        res = read(c->sfd, c->rbuf + c->rbytes, avail);
+        int avail = c->rsize - c->rbytes; //读buffer空间还有多少可用
+        res = read(c->sfd, c->rbuf + c->rbytes, avail); //往上下的空间写入数据
         if (res > 0) {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.bytes_read += res;
             pthread_mutex_unlock(&c->thread->stats.mutex);
             gotdata = READ_DATA_RECEIVED;
-            c->rbytes += res;
-            if (res == avail) {
+            //rytes是当前指针rcurr至读buffer末尾的数据大小
+			c->rbytes += res;
+            if (res == avail) { //socket还有可读数据
                 continue;
-            } else {
+            } else { //socket的可读数据都读取完毕
                 break;
             }
         }
@@ -3999,12 +4060,16 @@ static enum transmit_result transmit(conn *c) {
     }
 }
 
+//状态处理机
+//while循环里包含一个switch case，根据conn当前的连接状态conn_state，进入不同的case
+//case可能会改变conn的连接状态，连接状态不断发生转移，在下一次循环进入另一个case
+//直到最终进入某个case，将stop设置为true，结束循环
 static void drive_machine(conn *c) {
     bool stop = false;
     int sfd;
     socklen_t addrlen;
     struct sockaddr_storage addr;
-    int nreqs = settings.reqs_per_event;
+    int nreqs = settings.reqs_per_event; //每个连接可以处理的最大请求数
     int res;
     const char *str;
 #ifdef HAVE_ACCEPT4
@@ -4018,7 +4083,9 @@ static void drive_machine(conn *c) {
     while (!stop) {
 
         switch(c->state) {
-        case conn_listening:
+		//当listen_fd有事件到达后触发
+		//主线程状态机永远都是conn_listening状态
+        case conn_listening: 
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
             if (use_accept4) {
@@ -4027,6 +4094,7 @@ static void drive_machine(conn *c) {
                 sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
             }
 #else
+			//接收连接
             sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
 #endif
             if (sfd == -1) {
@@ -4066,6 +4134,7 @@ static void drive_machine(conn *c) {
                 stats.rejected_conns++;
                 STATS_UNLOCK();
             } else {
+				//主线程服务端接收到请求后，把client_fd分发给worker线程处理
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
                                      DATA_BUFFER_SIZE, tcp_transport);
             }
@@ -4073,6 +4142,7 @@ static void drive_machine(conn *c) {
             stop = true;
             break;
 
+		//等待数据
         case conn_waiting:
             if (!update_event(c, EV_READ | EV_PERSIST)) {
                 if (settings.verbose > 0)
@@ -4081,18 +4151,21 @@ static void drive_machine(conn *c) {
                 break;
             }
 
+			//将状态改为conn_read, 退出状态机循环
             conn_set_state(c, conn_read);
             stop = true;
             break;
 
+		//执行读取数据
         case conn_read:
+			//读出请求
             res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
 
             switch (res) {
             case READ_NO_DATA_RECEIVED:
-                conn_set_state(c, conn_waiting);
+                conn_set_state(c, conn_waiting);  //如果没有数据，则继续等待
                 break;
-            case READ_DATA_RECEIVED:
+            case READ_DATA_RECEIVED:  //成功接收数据，进入conn_parse_cmd状态，解析命令
                 conn_set_state(c, conn_parse_cmd);
                 break;
             case READ_ERROR:
@@ -4104,7 +4177,9 @@ static void drive_machine(conn *c) {
             }
             break;
 
+		//解析读出的数据
         case conn_parse_cmd :
+			//解析数据，如果解析的数据不够成一个完整的命令，则进入等待状态，等待更多的数据到达
             if (try_read_command(c) == 0) {
                 /* wee need more data! */
                 conn_set_state(c, conn_waiting);
@@ -4115,9 +4190,12 @@ static void drive_machine(conn *c) {
         case conn_new_cmd:
             /* Only process nreqs at a time to avoid starving other
                connections */
-
+			//一次event的发生，有可能包含多个命令，从client_fd里读取到的一次数据，可能是多个命令数据堆在一起的一次时间通知
+			//nreqs用来控制一次event最多能处理多少个命令
             --nreqs;
             if (nreqs >= 0) {
+				//准备执行命令，reset_cmd_handler做了一些解析命令之前的初始化动作
+				//因为一个event事件可能包含多条命令，所以需要reset一下再执行下一条命令
                 reset_cmd_handler(c);
             } else {
                 pthread_mutex_lock(&c->thread->stats.mutex);
@@ -4141,8 +4219,14 @@ static void drive_machine(conn *c) {
             }
             break;
 
+		//读取命令的第二部分
+		//eg: SET命令的第二部分： VALUE XXX
+		//由process_update_command执行后进入此状态，process_update_command函数只执行了add/set/replace 等命令的一半，剩下的一半由这里完成。
         case conn_nread:
+			//当rlbytes为0，表示读取完毕
+			//rlbytes表示要读取的"value"数据还剩下多少字节
             if (c->rlbytes == 0) {
+				//complete_nread()做一些收尾工作
                 complete_nread(c);
                 break;
             }
@@ -4157,10 +4241,15 @@ static void drive_machine(conn *c) {
             }
 
             /* first check if we have leftovers in the conn_read buffer */
-            if (c->rbytes > 0) {
+            //如果还有数据没有读完，则继续从buffer中读取数据向item中的data的value里填充
+			if (c->rbytes > 0) {
+				//tocopy为rlbytes和rbytes的最小值
+				//如果rlbytes小，只读rlbytes就够了，rbytes中多出的数据不是这个时候想要的
+				//如果rbytes小，即使需要rlbytes，buffer中也没有那么多
                 int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
                 if (c->ritem != c->rcurr) {
-                    memmove(c->ritem, c->rcurr, tocopy);
+					//为key设置value
+                    memmove(c->ritem, c->rcurr, tocopy); /
                 }
                 c->ritem += tocopy;
                 c->rlbytes -= tocopy;
@@ -4172,6 +4261,7 @@ static void drive_machine(conn *c) {
             }
 
             /*  now try reading from the socket */
+			//之前读取的buffer数据还不足够的情况，从socket中读取
             res = read(c->sfd, c->ritem, c->rlbytes);
             if (res > 0) {
                 pthread_mutex_lock(&c->thread->stats.mutex);
@@ -4279,6 +4369,7 @@ static void drive_machine(conn *c) {
             conn_set_state(c, conn_closing);
             break;
           }
+		  //执行transmit()发送数据到client
             switch (transmit(c)) {
             case TRANSMIT_COMPLETE:
                 if (c->state == conn_mwrite) {
@@ -4287,6 +4378,7 @@ static void drive_machine(conn *c) {
                     if(c->protocol == binary_prot) {
                         conn_set_state(c, c->write_and_go);
                     } else {
+						//重新将状态切换到conn_new_cmd等待客户端新的数据
                         conn_set_state(c, conn_new_cmd);
                     }
                 } else if (c->state == conn_write) {
@@ -4334,6 +4426,7 @@ static void drive_machine(conn *c) {
     return;
 }
 
+//主线程和worker线程监听与客户端的连接事件的处理函数
 void event_handler(const int fd, const short which, void *arg) {
     conn *c;
 
@@ -4350,12 +4443,14 @@ void event_handler(const int fd, const short which, void *arg) {
         return;
     }
 
+	//状态处理机，执行事件发生后的业务逻辑
     drive_machine(c);
 
     /* wait for next event */
     return;
 }
 
+//创建socket
 static int new_socket(struct addrinfo *ai) {
     int sfd;
     int flags;
@@ -4408,6 +4503,7 @@ static void maximize_sndbuf(const int sfd) {
         fprintf(stderr, "<%d send buffer was %d, now %d\n", sfd, old_size, last_good);
 }
 
+//创建socket
 /**
  * Create a socket and bind it to a specific port number
  * @param interface the interface to bind to
@@ -4438,6 +4534,8 @@ static int server_socket(const char *interface,
         port = 0;
     }
     snprintf(port_buf, sizeof(port_buf), "%d", port);
+
+	//获取网络地址（将主机名映射到网络地址）
     error= getaddrinfo(interface, port_buf, &hints, &ai);
     if (error != 0) {
         if (error != EAI_SYSTEM)
@@ -4449,7 +4547,7 @@ static int server_socket(const char *interface,
 
     for (next= ai; next; next= next->ai_next) {
         conn *listen_conn_add;
-        if ((sfd = new_socket(next)) == -1) {
+        if ((sfd = new_socket(next)) == -1) {  //创建socket
             /* getaddrinfo can return "junk" addresses,
              * we make sure at least one works before erroring.
              */
@@ -4471,7 +4569,7 @@ static int server_socket(const char *interface,
             }
         }
 #endif
-
+		//设置socket的属性
         setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
         if (IS_UDP(transport)) {
             maximize_sndbuf(sfd);
@@ -4489,6 +4587,7 @@ static int server_socket(const char *interface,
                 perror("setsockopt");
         }
 
+		//将地址ai_addr与socket（sfd）绑定
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
             if (errno != EADDRINUSE) {
                 perror("bind()");
@@ -4500,6 +4599,7 @@ static int server_socket(const char *interface,
             continue;
         } else {
             success++;
+			//listen(): 监听连接
             if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
                 perror("listen()");
                 close(sfd);
@@ -4546,6 +4646,7 @@ static int server_socket(const char *interface,
                                   UDP_READ_BUFFER_SIZE, transport);
             }
         } else {
+			//conn_new() 创建事件，加入主线程libevent进行监听
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
                                              EV_READ | EV_PERSIST, 1,
                                              transport, main_base))) {
@@ -4557,18 +4658,21 @@ static int server_socket(const char *interface,
         }
     }
 
+	//释放getaddrinfo()获取的网络地址的空间
     freeaddrinfo(ai);
 
     /* Return zero iff we detected no errors in starting up connections */
     return success == 0;
 }
 
+//创建服务端server_socket
 static int server_sockets(int port, enum network_transport transport,
                           FILE *portnumber_file) {
-    if (settings.inter == NULL) {
+    if (settings.inter == NULL) { //如果没有指定ip
         return server_socket(settings.inter, port, transport, portnumber_file);
     } else {
         // tokenize them and bind to each one of them..
+		//如果有指定ip端口的话，则解析出指定的ip和端口，并创建socket
         char *b;
         int ret = 0;
         char *list = strdup(settings.inter);
@@ -5075,12 +5179,13 @@ int main (int argc, char **argv) {
     signal(SIGINT, sig_handler);
 
     /* init settings */
-    settings_init();
+    settings_init();  //初始化配置
 
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
 
     /* process arguments */
+	//memcached启动时指定的启动参数配置
     while (-1 != (c = getopt(argc, argv,
           "a:"  /* access mask for unix socket */
           "A"  /* enable admin shutdown commannd */
@@ -5397,6 +5502,7 @@ int main (int argc, char **argv) {
         }
     }
 
+	//hash算法初始化
     if (hash_init(hash_type) != 0) {
         fprintf(stderr, "Failed to initialize hash_algorithm!\n");
         exit(EX_USAGE);
@@ -5473,6 +5579,7 @@ int main (int argc, char **argv) {
     }
 
     /* lose root privileges if we have them */
+	//身份验证
     if (getuid() == 0 || geteuid() == 0) {
         if (username == 0 || *username == '\0') {
             fprintf(stderr, "can't run as root without the -u switch\n");
@@ -5495,7 +5602,8 @@ int main (int argc, char **argv) {
 
     /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
-    if (do_daemonize) {
+	//以常驻进程方式运行
+	if (do_daemonize) {
         if (sigignore(SIGHUP) == -1) {
             perror("Failed to ignore SIGHUP");
         }
@@ -5518,13 +5626,15 @@ int main (int argc, char **argv) {
 #endif
     }
 
+	//初始化主线程的libevent实例
     /* initialize main thread libevent instance */
     main_base = event_init();
 
     /* initialize other stuff */
-    stats_init();
-    assoc_init(settings.hashpower_init);
-    conn_init();
+    stats_init();	//初始化全局统计
+    assoc_init(settings.hashpower_init);	//初始化hash表
+    conn_init();	//初始化连接对象，配置
+	//初始化slabs，这里会对一些内存管理进行初始化
     slabs_init(settings.maxbytes, settings.factor, preallocate);
 
     /*
@@ -5535,6 +5645,7 @@ int main (int argc, char **argv) {
         perror("failed to ignore SIGPIPE; sigaction");
         exit(EX_OSERR);
     }
+	//初始化线程，参数是worker线程个数和主线程的event_base，实现见Thread.c
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);
 
@@ -5542,6 +5653,7 @@ int main (int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
+	//如果开启了slab可重分配，则启动slab维护线程
     if (settings.slab_reassign &&
         start_slab_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);
@@ -5581,6 +5693,7 @@ int main (int argc, char **argv) {
         }
 
         errno = 0;
+		//建立服务端的server_socket（tcp协议）
         if (settings.port && server_sockets(settings.port, tcp_transport,
                                            portnumber_file)) {
             vperror("failed to listen on TCP port %d", settings.port);
@@ -5596,6 +5709,7 @@ int main (int argc, char **argv) {
 
         /* create the UDP listening socket and bind it */
         errno = 0;
+		//建立服务端的server_socket（udp协议）
         if (settings.udpport && server_sockets(settings.udpport, udp_transport,
                                               portnumber_file)) {
             vperror("failed to listen on UDP port %d", settings.udpport);
@@ -5625,6 +5739,7 @@ int main (int argc, char **argv) {
     drop_privileges();
 
     /* enter the event loop */
+	//进入libevent的事件循环
     if (event_base_loop(main_base, 0) != 0) {
         retval = EXIT_FAILURE;
     }

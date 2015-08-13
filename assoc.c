@@ -32,31 +32,35 @@ typedef  unsigned long  int  ub4;   /* unsigned 4-byte quantities */
 typedef  unsigned       char ub1;   /* unsigned 1-byte quantities */
 
 /* how many powers of 2's worth of buckets we use */
-unsigned int hashpower = HASHPOWER_DEFAULT;
+unsigned int hashpower = HASHPOWER_DEFAULT;  //hash表的指数，默认为16
 
-#define hashsize(n) ((ub4)1<<(n))
-#define hashmask(n) (hashsize(n)-1)
+#define hashsize(n) ((ub4)1<<(n))    //hash表长度 2^n次方
+#define hashmask(n) (hashsize(n)-1)  //hash掩码 0x1111 1111 1111 1111
 
 /* Main hash table. This is where we look except during expansion. */
-static item** primary_hashtable = 0;
+//主hash表，用于根据key查找item
+static item** primary_hashtable = 0;  
 
 /*
  * Previous hash table. During expansion, we look here for keys that haven't
  * been moved over to the primary yet.
  */
+ //旧的hash表，在扩展hash表时用到
 static item** old_hashtable = 0;
 
 /* Number of items in the hash table. */
-static unsigned int hash_items = 0;
+static unsigned int hash_items = 0;  //hash表中item的数量
 
 /* Flag: Are we in the middle of expanding now? */
-static bool expanding = false;
+static bool expanding = false;  //是否正在扩展hash表
 static bool started_expanding = false;
 
 /*
  * During expansion we migrate values with bucket granularity; this is how
  * far we've gotten so far. Ranges from 0 .. hashsize(hashpower - 1) - 1.
  */
+ //hash表扩展时，是以桶为粒度进行的，expand_bucket表示扩展到哪个桶
+ //取值从0到hashsize(hashpower-1)-1
 static unsigned int expand_bucket = 0;
 
 void assoc_init(const int hashtable_init) {
@@ -74,20 +78,24 @@ void assoc_init(const int hashtable_init) {
     STATS_UNLOCK();
 }
 
+//通过key查找item
 item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
     item *it;
     unsigned int oldbucket;
 
+	//hv & hashmask(hashpower - 1) 得到的是桶在hash表中的下标
     if (expanding &&
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
     {
         it = old_hashtable[oldbucket];
     } else {
+		//找到item所在的桶的链表的表头item
         it = primary_hashtable[hv & hashmask(hashpower)];
     }
 
     item *ret = NULL;
     int depth = 0;
+	//遍历桶的链表，直到找到指定的item
     while (it) {
         if ((nkey == it->nkey) && (memcmp(key, ITEM_key(it), nkey) == 0)) {
             ret = it;
@@ -102,7 +110,7 @@ item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
 
 /* returns the address of the item pointer before the key.  if *item == 0,
    the item wasn't found */
-
+//通过key查找item，返回的是当前item在桶链表中的前一个item的h_next
 static item** _hashitem_before (const char *key, const size_t nkey, const uint32_t hv) {
     item **pos;
     unsigned int oldbucket;
@@ -122,6 +130,7 @@ static item** _hashitem_before (const char *key, const size_t nkey, const uint32
 }
 
 /* grows the hashtable to the next power of 2. */
+//扩展hash表
 static void assoc_expand(void) {
     old_hashtable = primary_hashtable;
 
@@ -143,41 +152,51 @@ static void assoc_expand(void) {
     }
 }
 
+//唤醒hash表维护线程，进行hash表扩展工作
 static void assoc_start_expand(void) {
     if (started_expanding)
         return;
     started_expanding = true;
+	//发送一个信号给正处于阻塞等待状态的hash表维护线程，见assoc_maintenance_thread
     pthread_cond_signal(&maintenance_cond);
 }
 
 /* Note: this isn't an assoc_update.  The key must not already exist to call this */
+//把item插入hash表
 int assoc_insert(item *it, const uint32_t hv) {
     unsigned int oldbucket;
 
 //    assert(assoc_find(ITEM_key(it), it->nkey) == 0);  /* shouldn't have duplicately named things defined */
-
-    if (expanding &&
+ 
+	if (expanding &&
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
     {
         it->h_next = old_hashtable[oldbucket];
         old_hashtable[oldbucket] = it;
     } else {
+		//hv & hashmask(hashpower) 取得桶在hash表中的下标
+		//hash表冲突时，使用链表保存相同桶下标的item
+		//这里把新的item放到桶的链表头
         it->h_next = primary_hashtable[hv & hashmask(hashpower)];
         primary_hashtable[hv & hashmask(hashpower)] = it;
     }
 
     hash_items++;
     if (! expanding && hash_items > (hashsize(hashpower) * 3) / 2) {
-        assoc_start_expand();
+		//当hash表中的item数大于hash表桶数的1.5倍时，开始扩展hash表
+		assoc_start_expand();
     }
 
     MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey, hash_items);
     return 1;
 }
 
+//从hash表中删除某个item
 void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
-    item **before = _hashitem_before(key, nkey, hv);
+    //取得指向当前item的上一个item的h_next指针
+	item **before = _hashitem_before(key, nkey, hv);
 
+	//利用before指针，把当前item的h_next指向0，把上一个item的h_next指向原来before的h_next达到删除作用
     if (*before) {
         item *nxt;
         hash_items--;
@@ -201,6 +220,7 @@ static volatile int do_run_maintenance_thread = 1;
 #define DEFAULT_HASH_BULK_MOVE 1
 int hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
 
+//hash表维护线程工作时执行的函数
 static void *assoc_maintenance_thread(void *arg) {
 
     while (do_run_maintenance_thread) {
@@ -248,6 +268,7 @@ static void *assoc_maintenance_thread(void *arg) {
             /* We are done expanding.. just wait for next invocation */
             mutex_lock(&cache_lock);
             started_expanding = false;
+			//等待条件变量，当条件到达时唤醒线程继续往下执行
             pthread_cond_wait(&maintenance_cond, &cache_lock);
             /* Before doing anything, tell threads to use a global lock */
             mutex_unlock(&cache_lock);
@@ -263,6 +284,7 @@ static void *assoc_maintenance_thread(void *arg) {
 
 static pthread_t maintenance_tid;
 
+//启动hash表维护线程
 int start_assoc_maintenance_thread() {
     int ret;
     char *env = getenv("MEMCACHED_HASH_BULK_MOVE");
@@ -272,6 +294,7 @@ int start_assoc_maintenance_thread() {
             hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
         }
     }
+	//assoc_maintenance_thread为线程执行入口
     if ((ret = pthread_create(&maintenance_tid, NULL,
                               assoc_maintenance_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
@@ -280,14 +303,16 @@ int start_assoc_maintenance_thread() {
     return 0;
 }
 
+//停止hash表维护线程，在memcached服务退出时执行
 void stop_assoc_maintenance_thread() {
     mutex_lock(&cache_lock);
+	//发送信号assoc_maintenance_thread进入while循环相应的上下文，
+	//而设置do_run_maintenance_thread = 0让线程在下次while(    do_run_maintenance_thread )语句中退出循环
     do_run_maintenance_thread = 0;
     pthread_cond_signal(&maintenance_cond);
     mutex_unlock(&cache_lock);
 
     /* Wait for the maintenance thread to stop */
-    pthread_join(maintenance_tid, NULL);
+    //等待hash表维护线程停止
+	pthread_join(maintenance_tid, NULL);
 }
-
-
