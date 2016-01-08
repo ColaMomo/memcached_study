@@ -5,7 +5,8 @@
 
 ## 主线程
 
-主线程结构体定义
+主线程结构体定义  
+
 ``` c
 typedef struct {
     pthread_t thread_id;        //线程id
@@ -21,6 +22,7 @@ int main (int argc, char** argv) {
     main_base = event_init();
 
     //初始化线程，参数是worker线程个数和主线程的event_base，实现见Thread.c
+    //worker线程个数默认为4
     thread_init(settings.num_threads, main_base);
 
     //建立服务端的server_socket（tcp协议）
@@ -37,7 +39,7 @@ int main (int argc, char** argv) {
 }
 ```
 
-初始化主线程（thread.c）
+初始化主线程（thread.c）  
 ``` c
 void thread_init(int nthreads, struct event_base *main_base) {
     //创建nthreads个worker线程对象
@@ -143,7 +145,7 @@ static int server_socket(const char *interface, int port, enum network_transport
 }
 ```
 
-为server_socket创建事件
+创建连接对象，并加入监听事件
 ``` c
 //参数：sfd: 要监听的socket fd； init_state: 连接的初始化状态conn_states； event_flags: 监听的事件； read_buff_size: 度缓存大小； transport: 监听的socket类型； base: libevent对象event_base
 //返回值：每监听一个fd，都会创建一个conn来保存连接信息
@@ -158,13 +160,15 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
         MEMCACHED_CONN_CREATE(c);
 
+
         //初始化conn对象的一些参数
         c->rbuf = (char *)malloc((size_t)c->rsize);
         c->wbuf = (char *)malloc((size_t)c->wsize);
         ...
 
         c->sfd = sfd;
-        conns[sfd] = c;
+        conns
+       [sfd] = c;
     }
 
     if (transport == tcp_transport && init_state == conn_new_cmd) {
@@ -178,8 +182,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     ...
 
   	//创建libevent监听事件，并指定回调函数event_handler
-  	//主线程调用conn_new时，创建完listenfd后，调用此函数监听网络连接事件，此时conn_state为conn_listening
-  	//worker线程调用conn_new时，监听到event事件的回调处理函数与主线程不同
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
   	//将事件加入到libevent中
     event_base_set(base, &c->event);
@@ -303,7 +305,7 @@ static void drive_machine(conn *c) {
     while (!stop) {
         switch(c->state) {
 		//当主线程listen_fd有事件到达后触发，主线程的线程状态都是conn_listening状态
-        case conn_listening: 
+        case conn_listening:
             addrlen = sizeof(addr);
             sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
             if (settings.maxconns_fast &&
@@ -322,8 +324,9 @@ static void drive_machine(conn *c) {
 }
 ```
 
-将主线程的连接分发给worker线程
-这里主要完成两个工作，一是将接收到的client_fd封装成CQ_ITEM对象，写入到worker线程的CQ_ITEM队列中；二是向CQ_ITEM的管道写入一个字符c，通知从先程进行处理。
+将主线程的连接分发给worker线程  
+这里主要完成两个工作，一是将接收到的client_fd封装成CQ_ITEM对象，写入到worker线程的CQ_ITEM队列中；二是向CQ_ITEM的管道写入一个字符c，通知从先程进行处理。  
+
 ```
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
                        int read_buffer_size, enum network_transport transport) {
@@ -355,3 +358,67 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
     }
 }
 ```
+
+在worker线程的初始化方法setup_thread()中，worker线程将读取管道加入监听事件，当主线程向管道写入字符时，worker线程监听到事件发生，触发回调函数thread_libevent_process()
+
+```
+static void thread_libevent_process(int fd, short which, void *arg) {
+    LIBEVENT_THREAD *me = arg;
+    CQ_ITEM *item;
+    char buf[1];
+
+    if (read(fd, buf, 1) != 1) ｛｝
+
+    switch (buf[0]) {
+    case 'c':
+	//从队列中取出主线程放入的CQ_ITEM
+    item = cq_pop(me->new_conn_queue);
+
+    if (NULL != item) {
+		//创建监听事件，把worker线程传过来的client_fd加入监听事件，使用的是worker线程的libevent
+        conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
+                           item->read_buffer_size, item->transport, me->base);
+        if (c == NULL) {
+        	...
+        } else {
+			//设置监听连接的线程为当前worker线程
+            c->thread = me;
+        }
+        cqi_free(item);
+    }
+        break;
+    case 'l':
+    me->item_lock_type = ITEM_LOCK_GRANULAR;
+    register_thread_initialized();
+        break;
+    case 'g':
+    me->item_lock_type = ITEM_LOCK_GLOBAL;
+    register_thread_initialized();
+        break;
+    }
+}
+```
+
+在worker线程监听管道事件发生的回调函数中，worker线程也会调用conn_new(), 回看一下这个方法：  
+主线程调用conn_new时，监听的是serversocket_fd，conn_state为conn_listening  
+worker线程调用conn_new时，监听的是clientsocket_fd, conn_state为conn_new_cmd  
+主线程和worker线程拥有各自独立的event_base
+
+```
+conn *conn_new(const int sfd, enum conn_states init_state,
+                const int event_flags,
+                const int read_buffer_size, enum network_transport transport,
+                struct event_base *base) {
+    ...
+    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
+  	//将事件加入到libevent中
+    event_base_set(base, &c->event);
+    if (event_add(&c->event, 0) == -1) {
+    }
+    ...
+}
+```
+
+由此可以看出，worker线程监听两类事件，  
+一类是读取管道fd上的事件，负责与主线程进行交互，处理函数为thread_libevent_process()  
+一类是clientsocket_fd上的事件，负责与客户端进行交互，处理函数为event_handler()  
