@@ -248,12 +248,14 @@ static void settings_init(void) {
  *
  * Returns 0 on success, -1 on out-of-memory.
  */
+//获取一个新的msghdr，如果msghdr不够，进行扩容
 static int add_msghdr(conn *c)
 {
     struct msghdr *msg;
 
     assert(c != NULL);
 
+    //如果msglist的长度和已经使用的长度相等的时候，说明msglist已经用完了，需要扩容
     if (c->msgsize == c->msgused) {
         msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
         if (! msg) {
@@ -266,13 +268,13 @@ static int add_msghdr(conn *c)
         c->msgsize *= 2;
     }
 
-    msg = c->msglist + c->msgused;
+    msg = c->msglist + c->msgused;  //msg重新指向未使用的msghdr指针位置
 
     /* this wipes msg_iovlen, msg_control, msg_controllen, and
        msg_flags, the last 3 of which aren't defined on solaris: */
     memset(msg, 0, sizeof(struct msghdr));
 
-    msg->msg_iov = &c->iov[c->iovused];
+    msg->msg_iov = &c->iov[c->iovused];   //新的msghdr的msg_iov指向 struct iovec *iov结构
 
     if (IS_UDP(c->transport) && c->request_addr_size > 0) {
         msg->msg_name = &c->request_addr;
@@ -740,7 +742,8 @@ static int ensure_iov_space(conn *c) {
  *
  * Returns 0 on success, -1 on out-of-memory.
  */
-
+//用来拼接返回给客户端的数据结构。
+//主要做两件事：1. 将Memcached需要发送的数据，分成N多个IOV的块，2. 将IOV块添加到msghdr的结构中去。
 static int add_iov(conn *c, const void *buf, int len) {
     struct msghdr *m;
     int leftover;
@@ -749,6 +752,7 @@ static int add_iov(conn *c, const void *buf, int len) {
     assert(c != NULL);
 
     do {
+        //获取一个新的msghdr
         m = &c->msglist[c->msgused - 1];
 
         /*
@@ -758,16 +762,22 @@ static int add_iov(conn *c, const void *buf, int len) {
         limit_to_mtu = IS_UDP(c->transport) || (1 == c->msgused);
 
         /* We may need to start a new msghdr if this one is full. */
+        //如果msghdr结构中的iov满了，则需要使用新的msghdr
         if (m->msg_iovlen == IOV_MAX ||
             (limit_to_mtu && c->msgbytes >= UDP_MAX_PAYLOAD_SIZE)) {
+            //添加msghdr,这个方法中回去判断初始化的时候10个msghdr结构是否够用，不够用的话会扩容
+            //每次扩容会把容量翻倍，
             add_msghdr(c);
+            //指向下一个新的msghdr数据结构
             m = &c->msglist[c->msgused - 1];
         }
 
+        //确认IOV的空间大小，初始化默认是400个，如果IOV也不够用了，就会去扩容，每次扩容容量翻倍
         if (ensure_iov_space(c) != 0)
             return -1;
 
         /* If the fragment is too big to fit in the datagram, split it up */
+        //数据太大时，需要进行分片
         if (limit_to_mtu && len + c->msgbytes > UDP_MAX_PAYLOAD_SIZE) {
             leftover = len + c->msgbytes - UDP_MAX_PAYLOAD_SIZE;
             len -= leftover;
@@ -776,7 +786,7 @@ static int add_iov(conn *c, const void *buf, int len) {
         }
 
         m = &c->msglist[c->msgused - 1];
-        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
+        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;  //向IOV中填充BUF
         m->msg_iov[m->msg_iovlen].iov_len = len;
 
         c->msgbytes += len;
@@ -2472,6 +2482,7 @@ typedef struct token_s {
  *      command  = tokens[ix].value;
  *   }
  */
+//词法分析器，将命令拆分为token数组
 static size_t tokenize_command(char *command, token_t *tokens, const size_t max_tokens) {
     char *s, *e;
     size_t ntokens = 0;
@@ -2481,13 +2492,14 @@ static size_t tokenize_command(char *command, token_t *tokens, const size_t max_
     assert(command != NULL && tokens != NULL && max_tokens > 1);
 
     s = e = command;
+    //依次读取字符串，每遇到空格，将命令元素拆分出来，放入tokens数组中
     for (i = 0; i < len; i++) {
         if (*e == ' ') {
             if (s != e) {
                 tokens[ntokens].value = s;
                 tokens[ntokens].length = e - s;
                 ntokens++;
-                *e = '\0';
+                *e = '\0'; //把空格替换为字符串结束符‘\0’
                 if (ntokens == max_tokens - 1) {
                     e++;
                     s = e; /* so we don't add an extra token */
@@ -2513,7 +2525,7 @@ static size_t tokenize_command(char *command, token_t *tokens, const size_t max_
     tokens[ntokens].length = 0;
     ntokens++;
 
-    return ntokens;
+    return ntokens; //返回命令元素个数
 }
 
 /* set up a connection to write a buffer then free it, used for stats */
@@ -3785,7 +3797,7 @@ static int try_read_command(conn *c) {
         if (c->rbytes == 0)  //读buffer中没有待解析的数据
             return 0;
 
-        el = memchr(c->rcurr, '\n', c->rbytes); //通过换行符先找到第一个命令
+        el = memchr(c->rcurr, '\n', c->rbytes); //通过换行符‘\n’先找到第一个命令
         if (!el) {
             if (c->rbytes > 1024) {  //处理数据过长的情况
                 /*
@@ -3898,7 +3910,7 @@ static enum try_read_result try_read_network(conn *c) {
 
     while (1) {
         if (c->rbytes >= c->rsize) { //如果rbuf中剩余数据大于rbuf的大小，则对rbuf进行扩容
-            if (num_allocs == 4) {
+            if (num_allocs == 4) { //最多进行4次扩容
                 return gotdata;
             }
             ++num_allocs;
@@ -4009,16 +4021,20 @@ void do_accept_new_conns(const bool do_accept) {
 static enum transmit_result transmit(conn *c) {
     assert(c != NULL);
 
+    //校验前一次的数据是否发送完了，如果发送完了，则c->msgcurr指针就会往后移动一位
     if (c->msgcurr < c->msgused &&
             c->msglist[c->msgcurr].msg_iovlen == 0) {
         /* Finished writing the current msg; advance to the next. */
         c->msgcurr++;
     }
+
+    //如果c->msgcurr（已发送）小于c->msgused（已使用），则就可以知道还没发送完，则需要继续发送
+    //如果c->msgcurr（已发送）等于c->msgused（已使用），则说明已经发送完了，返回TRANSMIT_COMPLETE状态
     if (c->msgcurr < c->msgused) {
         ssize_t res;
-        struct msghdr *m = &c->msglist[c->msgcurr];
+        struct msghdr *m = &c->msglist[c->msgcurr]; //从c->msglist取出一个待发送的msghdr结构
 
-        res = sendmsg(c->sfd, m, 0);
+        res = sendmsg(c->sfd, m, 0);  //向客户端发送数据
         if (res > 0) {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.bytes_written += res;
@@ -5630,7 +5646,7 @@ int main (int argc, char **argv) {
 #endif
     }
 
-	//初始化主线程的libevent实例
+    //初始化主线程的libevent实例
     /* initialize main thread libevent instance */
     main_base = event_init();
 
@@ -5638,7 +5654,7 @@ int main (int argc, char **argv) {
     stats_init();	//初始化全局统计
     assoc_init(settings.hashpower_init);	//初始化hash表
     conn_init();	//初始化连接对象，配置
-	//初始化slabs，这里会对一些内存管理进行初始化
+	  //初始化slabs，这里会对一些内存管理进行初始化
     slabs_init(settings.maxbytes, settings.factor, preallocate);
 
     /*

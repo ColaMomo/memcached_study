@@ -20,7 +20,7 @@
 /* An item in the connection queue. */
 //CQ_ITEM结构体：
 //主线程accept连接后，将client_fd和其他一些与连接相关的信息包装成一个对象发送给worker线程
-typedef struct conn_queue_item CQ_ITEM; 
+typedef struct conn_queue_item CQ_ITEM;
 struct conn_queue_item {
     int               sfd;
     enum conn_states  init_state;
@@ -166,7 +166,7 @@ void item_unlock(uint32_t hv) {
 static void wait_for_thread_registration(int nthreads) {
     while (init_count < nthreads) {
 		//主线程利用条件变量等待所有worker线程启动完毕
-        pthread_cond_wait(&init_cond, &init_lock);  
+        pthread_cond_wait(&init_cond, &init_lock);
     }
 }
 
@@ -212,7 +212,7 @@ void switch_item_lock_type(enum item_lock_types type) {
 /*
  * Initializes a connection queue.
  */
-//初始化一个worker线程的CQ_ITEM接收的队列 
+//初始化一个worker线程的CQ_ITEM接收的队列
 static void cq_init(CQ *cq) {
     pthread_mutex_init(&cq->lock, NULL);
     cq->head = NULL;
@@ -243,7 +243,7 @@ static CQ_ITEM *cq_pop(CQ *cq) {
 /*
  * Adds an item to a connection queue.
  */
- //将一个CQ_ITEM对象 
+ //将一个CQ_ITEM对象
 static void cq_push(CQ *cq, CQ_ITEM *item) {
     item->next = NULL;
 
@@ -430,7 +430,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
     switch (buf[0]) {
     case 'c':
 	//从队列中取出主线程放入的CQ_ITEM
-    item = cq_pop(me->new_conn_queue); 
+    item = cq_pop(me->new_conn_queue);
 
     if (NULL != item) {
 		//创建监听事件，把worker线程传过来的client_fd加入监听事件，使用的是worker线程的libevent
@@ -530,6 +530,7 @@ int is_listen_thread() {
 /*
  * Allocates a new item.
  */
+//分配一个新的item
 item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
     item *it;
     /* do_item_alloc handles its own locks */
@@ -650,7 +651,7 @@ enum store_item_type store_item(item *item, int comm, conn* c) {
     enum store_item_type ret;
     uint32_t hv;
 
-    hv = hash(ITEM_key(item), item->nkey);  
+    hv = hash(ITEM_key(item), item->nkey);
     item_lock(hv);
     ret = do_store_item(item, comm, c, hv);
     item_unlock(hv);
@@ -910,4 +911,3 @@ void thread_init(int nthreads, struct event_base *main_base) {
     wait_for_thread_registration(nthreads);
     pthread_mutex_unlock(&init_lock);
 }
-

@@ -44,8 +44,8 @@ struct conn {
     struct msghdr *msglist;  //msghdr结构体数组，表示sendmsg要发送的消息列表
     int    msgsize;    //*msglist数组大小
     int    msgused;    //*msglist数组已使用的元素个数
-    int    msgcurr;    //当前要发送的msghdr
-    int    msgbytes;   //当前msghdr的字节数
+    int    msgcurr;    //当前未使用的msghdr
+    int    msgbytes;   //当前未使用的msghdr的字节数
 
     item   **ilist;  //get key1 key2命令时，要发送给客户端的item列表
     int    isize;    //列表大小
@@ -162,7 +162,7 @@ static void drive_machine(conn *c) {
 conn_lisntening为主线程建立连接的状态，具体执行的操作参见线程模型中的介绍。  
 其他状态都是worker线程的状态。 下面分别看每个状态对应的处理操作。
 
-### conn_new_cmd
+### conn_new_cmd：worker线程初始化状态
 
 work线程创建调用conn_new()方法创建连接对象，将连接状态初始化为conn_new_cmd, 监听clientsocket_fd.
 
@@ -202,7 +202,7 @@ static void reset_cmd_handler(conn *c) {
 }
 ```
 
-### conn_waiting
+### conn_waiting：等待数据
 conn_waiting状态会重新添加client_fd的读事件，并将连接状态更改为conn_read。  
 但是，在update_event()中可以看到，如果更新事件的flag与之前相同，则不会重新添加事件，这是利用了epoll的水平触发机制，只要fd中还有可读数据，那么每epoll_wait 都会触发事件。
 
@@ -234,7 +234,7 @@ static bool update_event(conn *c, const int new_flags) {
 }
 ```
 
-### conn_read
+### conn_read：读取数据
 
 ```
 //执行读取数据
@@ -309,7 +309,7 @@ static enum try_read_result try_read_network(conn *c) {
 }
 ```
 
-### conn_parse_cmd
+### conn_parse_cmd： 解析数据
 
 在conn_read状态机处理方法中，如果把数据成功读区到rbuf中，则将状态设置为conn_parse_cmd，对命令进行解析。
 
@@ -592,7 +592,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 }
 ```
 
-### conn_nread
+### conn_nread： 读取更多数据
 
 连接在状态process_update_command进行解析命令，更具解析的结果决定是需要进一步读取数据，还是执行操作返回结果。  
 对于二进制协议，conn_read状态只读取协议头部分，对协议头进行解析后，进入conn_nread状态读取body的内容。  
@@ -699,6 +699,28 @@ static void out_string(conn *c, const char *str) {
 
 ### conn_write
 
+memcached调用sendmsg()方法向客户端发送数据。  
+这里需要了解内核中两个数据传输的数据结构: msghdr和iovec
+
+```
+struct msghdr  { 
+    void  * msg_name ;     //消息的协议地址（客户端地址）
+    socklen_t msg_namelen ;    //地址的长度  
+    struct iovec  * msg_iov ;  //多io缓冲区的地址 
+     int  msg_iovlen ;   		//缓冲区的个数 
+    void  * msg_control ; 		//辅助数据的地址 
+    socklen_t msg_controllen ;	//辅助数据的长度 
+     int  msg_flags ; 			//接收消息的标识 
+} ;
+```
+
+```
+struct iovec  { 
+    void  * io_base ; 		//buffer空间的基地址 
+    size_t iov_len ; 		//该buffer空间的长度 
+} ;
+```
+
 ```
 case conn_write:
 	if (c->iovused == 0 || (IS_UDP(c->transport) && c->iovused == 1)) {
@@ -709,12 +731,44 @@ case conn_write:
     }
 ```
 
-add_iov()用来拼接返回给客户端的数据结构 
+add_iov()用来拼接返回给客户端的数据结构。  
+主要做两件事：1. 将Memcached需要发送的数据，分成N多个IOV的块，2. 将IOV块添加到msghdr的结构中去。
 
 ```
 static int add_iov(conn *c, const void *buf, int len) {
+	...
     do {
-    	...
+        //获取一个新的msghdr
+        m = &c->msglist[c->msgused - 1];
+        limit_to_mtu = IS_UDP(c->transport) || (1 == c->msgused);
+        //如果msghdr结构中的iov满了，则需要使用新的msghdr
+        if (m->msg_iovlen == IOV_MAX ||
+            (limit_to_mtu && c->msgbytes >= UDP_MAX_PAYLOAD_SIZE)) {
+            //添加msghdr,这个方法中回去判断初始化的时候10个msghdr结构是否够用，不够用的话会扩容，每次扩容会把容量翻倍，
+            add_msghdr(c);
+            m = &c->msglist[c->msgused - 1];  //指向下一个新的msghdr数据结构
+        }
+
+        //确认IOV的空间大小，初始化默认是400个，如果IOV也不够用了，就会去扩容，每次扩容容量翻倍
+        if (ensure_iov_space(c) != 0)
+            return -1;
+
+        //数据太大时，需要进行分片
+        if (limit_to_mtu && len + c->msgbytes > UDP_MAX_PAYLOAD_SIZE) {
+            leftover = len + c->msgbytes - UDP_MAX_PAYLOAD_SIZE;
+            len -= leftover;
+        } else {
+            leftover = 0;
+        }
+
+        m = &c->msglist[c->msgused - 1];
+        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;  //向IOV中填充BUF
+        m->msg_iov[m->msg_iovlen].iov_len = len;
+
+        c->msgbytes += len;
+        c->iovused++;
+        m->msg_iovlen++;
+
         buf = ((char *)buf) + len;
         len = leftover;
     } while (leftover > 0);
@@ -768,13 +822,29 @@ transmit() 调用sendmsg()方法将数据传输到客户端
 
 ```
 static enum transmit_result transmit(conn *c) {
+    //校验前一次的数据是否发送完了，如果发送完了，则c->msgcurr指针就会往后移动一位
+    if (c->msgcurr < c->msgused &&
+            c->msglist[c->msgcurr].msg_iovlen == 0) {
+        c->msgcurr++;
+    }
+
+    //如果c->msgcurr（已发送）小于c->msgused（已使用），说明还没发送完，需要继续发送  
+    //如果c->msgcurr（已发送）等于c->msgused（已使用），说明已经发送完了，返回TRANSMIT_COMPLETE状态  
     if (c->msgcurr < c->msgused) {
         ssize_t res;
-        struct msghdr *m = &c->msglist[c->msgcurr];
-
-        res = sendmsg(c->sfd, m, 0);
+        struct msghdr *m = &c->msglist[c->msgcurr]; //从c->msglist取出一个待发送的msghdr结构 
+        res = sendmsg(c->sfd, m, 0);  //向客户端发送数据 
         if (res > 0) {
-            ...
+            while (m->msg_iovlen > 0 && res >= m->msg_iov->iov_len) {
+                res -= m->msg_iov->iov_len;
+                m->msg_iovlen--;
+                m->msg_iov++;
+            }
+
+            if (res > 0) {
+                m->msg_iov->iov_base = (caddr_t)m->msg_iov->iov_base + res;
+                m->msg_iov->iov_len -= res;
+            }            
             return TRANSMIT_INCOMPLETE;
         }
         if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {

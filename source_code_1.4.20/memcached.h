@@ -352,13 +352,13 @@ extern struct settings settings;
  */
  //mc中存储的数据item
 typedef struct _stritem {
-    struct _stritem *next;	//链表的下一个元素的指针，这个链表可能是slots链表或者LRU链表，一个item不可能同时在这两个链表中，所以复用一个指针
-    struct _stritem *prev;  //链表的上一个元素的指针
-    struct _stritem *h_next;    /* hash chain next */	//相同hash值中链表的下一个
+    struct _stritem *next;	//记录下一个item的地址,用于LRU链表或freeslots链表
+    struct _stritem *prev;  //记录上一个item的地址,用于LRU链表或freeslots链表
+    struct _stritem *h_next;    /* hash chain next */	  //记录HashTable的下一个Item的地址
     rel_time_t      time;       /* least recent access */	//最近访问时间
-    rel_time_t      exptime;    /* expire time */	//过期时间
-    int             nbytes;     /* size of data */	//value的字节数
-    unsigned short  refcount;	//引用计数
+    rel_time_t      exptime;    /* expire time */	      //过期时间，为0时表示永不过期
+    int             nbytes;     /* size of data */	    //value的字节数
+    unsigned short  refcount;	  //引用计数
     uint8_t         nsuffix;    /* length of flags-and-length string */	//后缀长度
     uint8_t         it_flags;   /* ITEM_* above */	//标记
     uint8_t         slabs_clsid;/* which slab class we're in */	//item所在的slabclass的id值
@@ -428,7 +428,7 @@ struct conn {
     char   *rbuf;   /** buffer to read commands into */  //从socket读入数据的缓存
     char   *rcurr;  /** but if we parsed some already, this is where we stopped */ //从rbuf中读出数据时，用于表示尚未读取数据的起始位置
     int    rsize;   /** total allocated size of rbuf */  //读buffer大小
-    int    rbytes;  /** how much data, starting from rcur, do we have unparsed */  //rbuf中剩余数据的大小 
+    int    rbytes;  /** how much data, starting from rcur, do we have unparsed */  //rbuf中剩余数据的大小
 
     char   *wbuf;  //向socket中写入数据的缓存
     char   *wcurr;  //从wbuf向socket中写入数据时，尚未写入数据的起始位置
@@ -455,7 +455,7 @@ struct conn {
     int    sbytes;    /* how many bytes to swallow */
 
     /* data for the mwrite state */
-	//下面是向socket写入数据时用的字段
+    //下面是向socket写入数据时用的字段
     struct iovec *iov;  //iovec结构体数组
     int    iovsize;   /* number of elements allocated in iov[] */  //*iov数组大小
     int    iovused;   /* number of elements used in iov[] */	//*iov数组已被使用的元素个数
