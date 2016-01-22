@@ -39,7 +39,7 @@ unsigned int hashpower = HASHPOWER_DEFAULT;  //hash表的指数，默认为16
 
 /* Main hash table. This is where we look except during expansion. */
 //主hash表，用于根据key查找item
-static item** primary_hashtable = 0;  
+static item** primary_hashtable = 0;
 
 /*
  * Previous hash table. During expansion, we look here for keys that haven't
@@ -167,7 +167,7 @@ int assoc_insert(item *it, const uint32_t hv) {
     unsigned int oldbucket;
 
 //    assert(assoc_find(ITEM_key(it), it->nkey) == 0);  /* shouldn't have duplicately named things defined */
- 
+
 	if (expanding &&
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
     {
@@ -184,7 +184,7 @@ int assoc_insert(item *it, const uint32_t hv) {
     hash_items++;
     if (! expanding && hash_items > (hashsize(hashpower) * 3) / 2) {
 		//当hash表中的item数大于hash表桶数的1.5倍时，开始扩展hash表
-		assoc_start_expand();
+		    assoc_start_expand();
     }
 
     MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey, hash_items);

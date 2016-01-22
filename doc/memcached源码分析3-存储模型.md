@@ -871,3 +871,89 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
     assert(*before != 0);
 }
 ```
+
+#### rehash
+
+在调用assoc_insert()方法向hash表中插入数据时，如果hash表中的item数大于hash表桶数的1.5倍时，开始调用assoc_start_expand()方法扩展hash表  
+
+* int hash_bulk_move = DEFAULT_HASH_BULK_MOVE; //用于记录每次扩容时rehash几个桶的数据，默认为1  
+* static unsigned int expand_bucket = 0;  //用于扩容时下一个需要进行rehash的桶的位置  
+在查找、插入和删除时，根据hash值和expand_bucket值的比较，决定是操作旧的hash表还是新的hash表。  
+* static bool expanding = false;  //是否正在扩展hash表  
+* static bool started_expanding = false;  //是否开始扩展hash表
+
+```
+static void assoc_start_expand(void) {
+    if (started_expanding)
+        return;
+    started_expanding = true;
+	//发送一个信号给正处于阻塞等待状态的hash表维护线程，见assoc_maintenance_thread
+    pthread_cond_signal(&maintenance_cond);
+}
+```
+
+```
+static void *assoc_maintenance_thread(void *arg) {
+
+    while (do_run_maintenance_thread) {
+        int ii = 0;
+
+        item_lock_global();
+        mutex_lock(&cache_lock);
+
+        for (ii = 0; ii < hash_bulk_move && expanding; ++ii) {
+            item *it, *next;
+            int bucket;
+            
+            //遍历扩容时需要进行rehash的桶中的元素，将其放入新的hash表中
+            for (it = old_hashtable[expand_bucket]; NULL != it; it = next) {
+                next = it->h_next;
+
+                bucket = hash(ITEM_key(it), it->nkey) & hashmask(hashpower);
+                it->h_next = primary_hashtable[bucket];
+                primary_hashtable[bucket] = it;
+            }
+
+            old_hashtable[expand_bucket] = NULL; //释放原hash表中完成rehash的桶链表
+
+            expand_bucket++; 
+            //expand_bucket等于原hash表长度时，整个rehash的工作已经完成了
+            if (expand_bucket == hashsize(hashpower - 1)) { 
+                expanding = false;
+                free(old_hashtable);  //释放原hash表空间
+                stats.hash_bytes -= hashsize(hashpower - 1) * sizeof(void *);
+                stats.hash_is_expanding = 0;
+            }
+        }
+
+        if (!expanding) {  
+            slabs_rebalancer_resume();
+            started_expanding = false;
+			//等待条件变量，当条件到达时唤醒线程继续往下执行
+            pthread_cond_wait(&maintenance_cond, &cache_lock);
+            slabs_rebalancer_pause();
+            assoc_expand();
+        }
+    }
+    return NULL;
+}
+```
+
+```
+static void assoc_expand(void) {
+    old_hashtable = primary_hashtable;  //将现在的hash表设为旧的hash表
+
+	//为新的hash表申请空间，新的hash表长度是旧hash表的两倍
+    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *)); 
+    if (primary_hashtable) {
+        hashpower++;
+        expanding = true;
+        expand_bucket = 0;
+        stats.hash_power_level = hashpower;
+        stats.hash_bytes += hashsize(hashpower) * sizeof(void *);
+        stats.hash_is_expanding = 1;
+    } else {
+        primary_hashtable = old_hashtable;
+    }
+}
+```

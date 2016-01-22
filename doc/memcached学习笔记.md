@@ -1,10 +1,5 @@
 # memcached 学习笔记
 
-## memcached 整体架构
-* 线程模型
-* 请求处理
-* 内存模型
-
 ## memcached 代码结构
 * memcached.h -- memcached重要数据结构的定义如conn，conn_state，item
 * memcached.c -- 启动入口
@@ -12,6 +7,9 @@
 * item.c -- item的相关操作
 * slab.c -- slab管理
 * assoc.c -- hash表的相关操作
+
+## 安装启动
+
 
 ## 相关资源
 
